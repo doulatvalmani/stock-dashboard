@@ -2,11 +2,34 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
+import time
+import logging
 from datetime import datetime
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("stock_dashboard")
 
 st.set_page_config(page_title="Stock Dashboard", layout="wide")
 
 st.title("📊 Stock Analysis Dashboard")
+
+MAX_TICKERS = 6  # cap to keep load times and layout sane
+
+
+def with_retry(fn, *args, attempts=3, base_delay=1.5, **kwargs):
+    """Run fn(*args, **kwargs), retrying on failure with exponential backoff.
+    Returns the result, or None if all attempts fail."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Attempt {attempt}/{attempts} failed for {fn.__name__}: {e}")
+            if attempt < attempts:
+                time.sleep(base_delay * attempt)
+    logger.error(f"All {attempts} attempts failed for {fn.__name__}: {last_error}")
+    return None
 
 # Fallback list used only if the live Yahoo search API is unavailable
 FALLBACK_COMPANIES = {
@@ -29,19 +52,23 @@ PERIOD_OPTIONS = {
 }
 
 
+def _search(query):
+    return yf.Search(query, max_results=5).quotes
+
+
 @st.cache_data(ttl=600)
 def search_company(query):
     """Look up a company name and return possible ticker matches."""
-    try:
-        results = yf.Search(query, max_results=5).quotes
+    results = with_retry(_search, query, attempts=2, base_delay=1.0)
+    matches = []
+    if results:
         matches = [
             {"symbol": r.get("symbol"), "name": r.get("shortname") or r.get("longname") or ""}
             for r in results if r.get("symbol")
         ]
-        if matches:
-            return matches
-    except Exception:
-        pass
+
+    if matches:
+        return matches
 
     key = query.strip().lower()
     if key in FALLBACK_COMPANIES:
@@ -49,9 +76,16 @@ def search_company(query):
     return []
 
 
+def _download(symbol, period):
+    return yf.download(symbol, period=period, interval="1d", progress=False)
+
+
 @st.cache_data(ttl=600)
 def load_data(symbol, period):
-    return yf.download(symbol, period=period, interval="1d")
+    result = with_retry(_download, symbol, period)
+    if result is None:
+        return pd.DataFrame()
+    return result
 
 
 def resolve_input(raw, period):
@@ -96,12 +130,15 @@ def prep_dataframe(data):
     return data
 
 
+def _fetch_news(symbol):
+    return yf.Ticker(symbol).news or []
+
+
 @st.cache_data(ttl=600)
 def get_news(symbol):
     """Fetch recent news headlines for a ticker. Returns list of (title, link, publisher)."""
-    try:
-        items = yf.Ticker(symbol).news or []
-    except Exception:
+    items = with_retry(_fetch_news, symbol, attempts=2, base_delay=1.0)
+    if not items:
         return []
 
     results = []
@@ -160,6 +197,11 @@ raw_input = st.text_input(
 )
 
 entries = [t.strip() for t in raw_input.split(",") if t.strip()]
+entries = [e[:50] for e in entries]  # guard against absurdly long single entries
+
+if len(entries) > MAX_TICKERS:
+    st.warning(f"Showing the first {MAX_TICKERS} tickers only — enter fewer for best performance.")
+    entries = entries[:MAX_TICKERS]
 
 resolved = []
 failed = []
@@ -195,6 +237,19 @@ for col, (symbol, name) in zip(wl_cols, resolved):
 
 @st.fragment(run_every="10m")
 def render_dashboard(resolved_tickers, period):
+    try:
+        _render_dashboard_inner(resolved_tickers, period)
+    except Exception as e:
+        logger.exception("Unexpected error while rendering dashboard")
+        st.error(
+            "Something went wrong while loading this dashboard. "
+            "This is usually temporary — try refreshing the page in a moment."
+        )
+        with st.expander("Technical details (for debugging)"):
+            st.code(str(e))
+
+
+def _render_dashboard_inner(resolved_tickers, period):
 
     st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} • Range: {range_label}")
 
