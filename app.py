@@ -90,7 +90,33 @@ def prep_dataframe(data):
     data["MA20"] = data["Close"].rolling(20).mean()
     data["MA50"] = data["Close"].rolling(50).mean()
     data["RSI"] = compute_rsi(data["Close"])
+    bb_std = data["Close"].rolling(20).std()
+    data["BB_Upper"] = data["MA20"] + 2 * bb_std
+    data["BB_Lower"] = data["MA20"] - 2 * bb_std
     return data
+
+
+@st.cache_data(ttl=600)
+def get_news(symbol):
+    """Fetch recent news headlines for a ticker. Returns list of (title, link, publisher)."""
+    try:
+        items = yf.Ticker(symbol).news or []
+    except Exception:
+        return []
+
+    results = []
+    for item in items[:5]:
+        content = item.get("content", item)
+        title = content.get("title") or item.get("title") or "Untitled"
+        link = None
+        canonical = content.get("canonicalUrl")
+        if isinstance(canonical, dict):
+            link = canonical.get("url")
+        link = link or content.get("link") or item.get("link")
+        provider = content.get("provider")
+        publisher = provider.get("displayName") if isinstance(provider, dict) else content.get("publisher") or item.get("publisher")
+        results.append((title, link, publisher))
+    return results
 
 
 # ---------------- Sidebar: date range + watchlist ----------------
@@ -213,6 +239,40 @@ def render_dashboard(resolved_tickers, period):
             st.caption(f"Open: ${open_p:.2f}  •  High: ${high_p:.2f}  •  Low: ${low_p:.2f}")
             st.caption(f"Volume: {volume:,}")
 
+    # ---- Portfolio Tracker ----
+    with st.expander("💼 Portfolio Tracker — enter shares & buy price to see gain/loss"):
+        st.caption("Values are not saved permanently — they reset if you close this tab.")
+        portfolio_rows = []
+        pf_cols = st.columns(len(all_data))
+        for pf_col, (symbol, info) in zip(pf_cols, all_data.items()):
+            with pf_col:
+                st.markdown(f"**{symbol}**")
+                shares = st.number_input(
+                    f"Shares owned", min_value=0.0, value=0.0, step=1.0, key=f"shares_{symbol}"
+                )
+                buy_price = st.number_input(
+                    f"Avg buy price ($)", min_value=0.0, value=0.0, step=0.01, key=f"buyprice_{symbol}"
+                )
+                if shares > 0 and buy_price > 0:
+                    current_price = float(info["df"]["Close"].iloc[-1])
+                    cost = shares * buy_price
+                    value = shares * current_price
+                    gain = value - cost
+                    gain_pct = (gain / cost) * 100
+                    st.metric("Current Value", f"${value:,.2f}", f"{gain_pct:+.2f}%")
+                    st.caption(f"Cost basis: ${cost:,.2f}  •  Gain/Loss: ${gain:,.2f}")
+                    portfolio_rows.append({"symbol": symbol, "cost": cost, "value": value})
+
+        if portfolio_rows:
+            total_cost = sum(r["cost"] for r in portfolio_rows)
+            total_value = sum(r["value"] for r in portfolio_rows)
+            total_gain = total_value - total_cost
+            total_gain_pct = (total_gain / total_cost) * 100 if total_cost else 0
+            st.divider()
+            st.subheader("Total Portfolio")
+            st.metric("Total Value", f"${total_value:,.2f}", f"{total_gain_pct:+.2f}%")
+            st.caption(f"Total Cost: ${total_cost:,.2f}  •  Total Gain/Loss: ${total_gain:,.2f}")
+
     # ---- Comparison chart ----
     if len(all_data) > 1:
         st.subheader("Comparison — Normalized % Change")
@@ -244,6 +304,26 @@ def render_dashboard(resolved_tickers, period):
                 )])
                 fig.update_layout(height=400, margin=dict(l=10, r=10, t=10, b=10))
                 st.plotly_chart(fig, use_container_width=True, key=f"candle_{symbol}")
+
+            with st.expander("📐 Bollinger Bands"):
+                bb_data = df.dropna(subset=["BB_Upper", "BB_Lower"])
+                if bb_data.empty:
+                    st.caption("Not enough history in this date range to compute Bollinger Bands.")
+                else:
+                    st.caption("Bands widen during high volatility, narrow during low volatility.")
+                    st.line_chart(bb_data[["Close", "BB_Upper", "BB_Lower"]])
+
+            with st.expander(f"📰 Latest news — {symbol}"):
+                news_items = get_news(symbol)
+                if not news_items:
+                    st.caption("No recent news found.")
+                else:
+                    for title, link, publisher in news_items:
+                        byline = f" — *{publisher}*" if publisher else ""
+                        if link:
+                            st.markdown(f"- [{title}]({link}){byline}")
+                        else:
+                            st.markdown(f"- {title}{byline}")
 
             st.caption("Volume")
             st.bar_chart(df["Volume"])
