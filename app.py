@@ -70,12 +70,26 @@ def resolve_input(raw):
     return None, None, matches
 
 
+def compute_rsi(close, period=14):
+    """Relative Strength Index — momentum indicator, 0-100 scale.
+    Above 70 is generally considered overbought, below 30 oversold."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
 def prep_dataframe(data):
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
     data = data.copy()
     data["MA20"] = data["Close"].rolling(20).mean()
     data["MA50"] = data["Close"].rolling(50).mean()
+    data["RSI"] = compute_rsi(data["Close"])
     return data
 
 
@@ -134,12 +148,26 @@ def render_dashboard(resolved_tickers):
         prev = df.iloc[-2] if len(df) > 1 else latest
         price = float(latest["Close"])
         change_pct = ((price - float(prev["Close"])) / float(prev["Close"])) * 100 if len(df) > 1 else 0
+
+        open_p = float(latest["Open"])
+        high_p = float(latest["High"])
+        low_p = float(latest["Low"])
+        volume = int(latest["Volume"])
+        rsi = latest["RSI"]
+        ma20 = latest["MA20"]
+        ma50 = latest["MA50"]
+
         with col:
             st.metric(f"{symbol} — {info['name']}", f"${price:.2f}", f"{change_pct:+.2f}%")
-            ma20 = latest["MA20"]
-            ma50 = latest["MA50"]
             st.caption(f"MA20: ${ma20:.2f}" if pd.notna(ma20) else "MA20: N/A")
             st.caption(f"MA50: ${ma50:.2f}" if pd.notna(ma50) else "MA50: N/A")
+            if pd.notna(rsi):
+                rsi_label = "Overbought" if rsi > 70 else "Oversold" if rsi < 30 else "Neutral"
+                st.caption(f"RSI(14): {rsi:.1f} ({rsi_label})")
+            else:
+                st.caption("RSI(14): N/A")
+            st.caption(f"Open: ${open_p:.2f}  •  High: ${high_p:.2f}  •  Low: ${low_p:.2f}")
+            st.caption(f"Volume: {volume:,}")
 
     # ---- Comparison chart (normalized % change so different price scales compare fairly) ----
     if len(all_data) > 1:
@@ -162,6 +190,15 @@ def render_dashboard(resolved_tickers):
                 chart_data = df.dropna(subset=["Close"])
             chart_cols = [c for c in ["Close", "MA20", "MA50"] if chart_data[c].notna().any()]
             st.line_chart(chart_data[chart_cols])
+
+            st.caption("Volume")
+            st.bar_chart(df["Volume"])
+
+            rsi_data = df.dropna(subset=["RSI"])
+            if not rsi_data.empty:
+                st.caption("RSI(14) — above 70 = overbought, below 30 = oversold")
+                st.line_chart(rsi_data["RSI"])
+
             with st.expander(f"View raw data — {symbol}"):
                 st.dataframe(df.tail(50))
 
